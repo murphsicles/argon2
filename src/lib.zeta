@@ -1,0 +1,228 @@
+// Auto-converted from /tmp/df-argon2-0.5.3/argon2-0.5.3/src/lib.rs
+
+#[cfg(not(any(target_pointer_width = "32", target_pointer_width = "64")))] compile_error!("this crate builds on 32-bit and 64-bit platforms only");
+// [unsupported item]
+// [unsupported item]
+mod algorithm;
+mod blake2b_long;
+mod block;
+mod error;
+mod params;
+mod version;
+pub use crate::{ algorithm::Algorithm, block::Block, error::{ Error, Result }, params::{ AssociatedData, KeyId, Params, ParamsBuilder }, version::Version };
+#[cfg(feature = "password-hash")] #[cfg_attr(docsrs, doc(cfg(feature = "password-hash")))] pub use { crate::algorithm::{ ARGON2D_IDENT, ARGON2ID_IDENT, ARGON2I_IDENT }, password_hash::{ self, PasswordHash, PasswordHasher, PasswordVerifier } };
+use crate::blake2b_long::blake2b_long;
+use blake2::{ digest, Blake2b512, Digest };
+use core::fmt;
+#[cfg(all(feature = "alloc", feature = "password-hash"))] use password_hash::{ Decimal, Ident, ParamsString, Salt };
+#[cfg(feature = "zeroize")] use zeroize::Zeroize;
+pub const MAX_PWD_LEN: usize = 0xFFFFFFFF;
+
+pub const MIN_SALT_LEN: usize = 8;
+
+pub const MAX_SALT_LEN: usize = 0xFFFFFFFF;
+
+pub const RECOMMENDED_SALT_LEN: usize = 16;
+
+pub const MAX_SECRET_LEN: usize = 0xFFFFFFFF;
+
+const SYNC_POINTS: usize = 4;
+
+const ADDRESSES_IN_BLOCK: usize = 128;
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))] cpufeatures::new!(avx2_cpuid, "avx2");
+/// Argon2 context.
+/// 
+/// This is the primary type of this crate's API, and contains the following:
+/// 
+/// - Argon2 [`Algorithm`] variant to be used
+/// - Argon2 [`Version`] to be used
+/// - Default set of [`Params`] to be used
+/// - (Optional) Secret key a.k.a. "pepper" to be used
+#[derive(Clone)]
+pub struct Argon2<key> {
+ algorithm: Algorithm,
+ version: Version,
+ params: Params,
+ secret: Option<&[u8]>,
+ cpu_feat_avx2: avx2_cpuid::InitToken,
+}
+
+impl Default for Argon2<'_> {
+ fn default() -> Self {
+ Self::new(Algorithm::default(), Version::default(), Params::default())
+ }
+ 
+}
+
+impl fmt::Debug for Argon2<'_> {
+ fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
+ fmt.debug_struct("Argon2").field("algorithm", &self.algorithm).field("version", &self.version).field("params", &self.params).finish_non_exhaustive()
+ }
+ 
+}
+
+impl<key> Argon2<'key> {
+ pub fn new(algorithm: Algorithm, version: Version, params: Params) -> Self {
+ Self { algorithm, version, params, secret: None, #[cfg(any(target_arch = "x86", target_arch = "x86_64"))] cpu_feat_avx2: avx2_cpuid::init() }
+ }
+ 
+ pub fn new_with_secret(secret: &[u8], algorithm: Algorithm, version: Version, params: Params) -> Result<Self> {
+ if MAX_SECRET_LEN<secret.len() { return Err(Error::SecretTooLong); }
+ Ok(Self { algorithm, version, params, secret: Some(secret), #[cfg(any(target_arch = "x86", target_arch = "x86_64"))] cpu_feat_avx2: avx2_cpuid::init() })
+ }
+ 
+ pub fn hash_password_into(&self, pwd: &[u8], salt: &[u8], out: &mut [u8]) -> Result<()> {
+ let mut blocks = vec ! [Block::default(); self.params.block_count()];
+ self.hash_password_into_with_memory(pwd, salt, out, &mut blocks)
+ }
+ 
+ pub fn hash_password_into_with_memory(&self, pwd: &[u8], salt: &[u8], out: &mut [u8], memory_blocks: impl AsMut<[Block]>) -> Result<()> {
+ if out.len()<self.params.output_len().unwrap_or(Params::MIN_OUTPUT_LEN) { return Err(Error::OutputTooShort); }
+ if out.len()> self.params.output_len().unwrap_or(Params::MAX_OUTPUT_LEN) { return Err(Error::OutputTooLong); }
+ Self::verify_inputs(pwd, salt) ?;
+ let initial_hash = self.initial_hash(pwd, salt, out);
+ self.fill_blocks(memory_blocks.as_mut(), initial_hash) ?;
+ self.finalize(memory_blocks.as_mut(), out)
+ }
+ 
+ pub fn fill_memory(&self, pwd: &[u8], salt: &[u8], memory_blocks: impl AsMut<[Block]>) -> Result<()> {
+ Self::verify_inputs(pwd, salt) ?;
+ let initial_hash = self.initial_hash(pwd, salt, & []);
+ self.fill_blocks(memory_blocks.as_mut(), initial_hash)
+ }
+ 
+ fn fill_blocks(&self, memory_blocks: &mut [Block], initial_hash: digest::Output<Blake2b512>) -> Result<()> {
+ let block_count = self.params.block_count();
+ let memory_blocks = memory_blocks.get_mut(.. block_count).ok_or(Error::MemoryTooLittle) ?;
+ let segment_length = self.params.segment_length();
+ let iterations = self.params.t_cost() as usize;
+ let lane_length = self.params.lane_length();
+ let lanes = self.params.lanes();
+ for(l, lane) in memory_blocks.chunks_exact_mut(lane_length).enumerate() { for(i, block) in lane [.. 2] . iter_mut().enumerate() { let i = i as u32; let l = l as u32; let inputs = & [initial_hash.as_ref(), &i.to_le_bytes() [..], &l.to_le_bytes() [..] ,]; let mut hash = [0u8; Block::SIZE]; blake2b_long(inputs, &mut hash) ?; block.load(&hash); } }
+ #[cfg(feature = "zeroize")] initial_hash.zeroize();
+ for pass in 0 .. iterations { for slice in 0 .. SYNC_POINTS { let data_independent_addressing = self.algorithm == Algorithm::Argon2i || (self.algorithm == Algorithm::Argon2id &&pass == 0 &&slice<SYNC_POINTS / 2); for lane in 0 .. lanes { let mut address_block = Block::default(); let mut input_block = Block::default(); let zero_block = Block::default(); if data_independent_addressing { input_block.as_mut() [.. 6] . copy_from_slice(&[pass as u64, lane as u64, slice as u64, memory_blocks.len() as u64, iterations as u64, self.algorithm as u64, ]); } let first_block = if pass == 0 &&slice == 0 { if data_independent_addressing { self.update_address_block(&mut address_block, &mut input_block, &zero_block ); } 2 } else { 0 }; let mut cur_index = lane *lane_length + slice *segment_length + first_block; let mut prev_index = if slice == 0 &&first_block == 0 { cur_index + lane_length - 1 } else { cur_index - 1 }; for block in first_block .. segment_length { let rand = if data_independent_addressing { let addres_index = block % ADDRESSES_IN_BLOCK; if addres_index == 0 { self.update_address_block(&mut address_block, &mut input_block, &zero_block ); } address_block.as_ref() [addres_index] } else { memory_blocks [prev_index] . as_ref() [0] }; let ref_lane = if pass == 0 &&slice == 0 { lane } else { (rand>> 32) as usize % lanes }; let reference_area_size = if pass == 0 { if slice == 0 { block - 1 } else if ref_lane == lane { slice * segment_length + block - 1 } else { slice * segment_length - if block == 0 { 1 } else { 0 } } } else { if ref_lane == lane { lane_length - segment_length + block - 1 } else { lane_length - segment_length - if block == 0 { 1 } else { 0 } } }; let mut map = rand &0xFFFFFFFF; map = (map * map)>> 32; let relative_position = reference_area_size - 1 - ((reference_area_size as u64 * map)>> 32) as usize; let start_position = if pass != 0 &&slice != SYNC_POINTS - 1 { (slice + 1) * segment_length } else { 0 }; let lane_index = (start_position + relative_position) % lane_length; let ref_index = ref_lane * lane_length + lane_index; let result = self.compress(&memory_blocks [prev_index], &memory_blocks [ref_index]); if self.version == Version::V0x10 || pass == 0 { memory_blocks [cur_index] = result; } else { memory_blocks [cur_index] ^= &result; }; prev_index = cur_index; cur_index += 1; } } } }
+ Ok(())
+ }
+ 
+ fn compress(&self, rhs: &Block, lhs: &Block) -> Block {
+ #[cfg(any(target_arch = "x86", target_arch = "x86_64"))] { #[doc = " Enable AVX2 optimizations."] #[target_feature(enable = "avx2")] unsafe fn compress_avx2(rhs: &Block, lhs: &Block) -> Block { Block::compress(rhs, lhs) } if self.cpu_feat_avx2.get() { return unsafe { compress_avx2(rhs, lhs) }; } }
+ Block::compress(rhs, lhs)
+ }
+ 
+ pub fn params(&self) -> &Params {
+ &self.params
+ }
+ 
+ fn finalize(&self, memory_blocks: &[Block], out: &mut [u8]) -> Result<()> {
+ let lane_length = self.params.lane_length();
+ let mut blockhash = memory_blocks [lane_length - 1];
+ for l in 1 .. self.params.lanes() { let last_block_in_lane = l * lane_length + (lane_length - 1); blockhash ^= &memory_blocks [last_block_in_lane]; }
+ let mut blockhash_bytes = [0u8; Block::SIZE];
+ for(chunk, v) in blockhash_bytes.chunks_mut(8).zip(blockhash.iter()) { chunk.copy_from_slice(&v.to_le_bytes()) }
+ blake2b_long(& [&blockhash_bytes], out) ?;
+ #[cfg(feature = "zeroize")] { blockhash.zeroize(); blockhash_bytes.zeroize(); }
+ Ok(())
+ }
+ 
+ fn update_address_block(&self, address_block: &mut Block, input_block: &mut Block, zero_block: &Block) {
+ input_block.as_mut() [6] += 1;
+ *address_block = self.compress(zero_block, input_block);
+ *address_block = self.compress(zero_block, address_block);
+ }
+ 
+ fn initial_hash(&self, pwd: &[u8], salt: &[u8], out: &[u8]) -> digest::Output<Blake2b512> {
+ let mut digest = Blake2b512::new();
+ digest.update(self.params.p_cost().to_le_bytes());
+ digest.update((out.len() as u32).to_le_bytes());
+ digest.update(self.params.m_cost().to_le_bytes());
+ digest.update(self.params.t_cost().to_le_bytes());
+ digest.update(self.version.to_le_bytes());
+ digest.update(self.algorithm.to_le_bytes());
+ digest.update((pwd.len() as u32).to_le_bytes());
+ digest.update(pwd);
+ digest.update((salt.len() as u32).to_le_bytes());
+ digest.update(salt);
+ if let Some(secret) = &self.secret { digest.update((secret.len() as u32).to_le_bytes()); digest.update(secret); } else { digest.update(0u32.to_le_bytes()); }
+ digest.update((self.params.data().len() as u32).to_le_bytes());
+ digest.update(self.params.data());
+ digest.finalize()
+ }
+ 
+ fn verify_inputs(pwd: &[u8], salt: &[u8]) -> Result<()> {
+ if pwd.len() > MAX_PWD_LEN { return Err(Error::PwdTooLong); }
+ if salt.len()<MIN_SALT_LEN { return Err(Error::SaltTooShort); }
+ if salt.len()> MAX_SALT_LEN { return Err(Error::SaltTooLong); }
+ Ok(())
+ }
+ 
+}
+
+#[cfg(all(feature = "alloc", feature = "password-hash"))]
+#[cfg_attr(docsrs, doc(cfg(feature = "alloc")))]
+#[cfg_attr(docsrs, doc(cfg(feature = "password-hash")))]
+impl PasswordHasher for Argon2<'_> {
+ type Params = Params;
+ fn hash_password(&self, password: &[u8], salt: impl Into<Salt<'a>>) -> password_hash::Result<PasswordHash<'a>> {
+ let salt = salt.into();
+ let mut salt_arr = [0u8; 64];
+ let salt_bytes = salt.decode_b64(&mut salt_arr) ?;
+ let output_len = self.params.output_len().unwrap_or(Params::DEFAULT_OUTPUT_LEN);
+ let output = password_hash::Output::init_with(output_len, | out | { Ok(self.hash_password_into(password, salt_bytes, out) ?) }) ?;
+ Ok(PasswordHash { algorithm: self.algorithm.ident(), version: Some(self.version.into()), params: ParamsString::try_from(&self.params) ?, salt: Some(salt), hash: Some(output) })
+ }
+ 
+ fn hash_password_customized(&self, password: &[u8], alg_id: Option<Ident<'a>>, version: Option<Decimal>, params: Params, salt: impl Into<Salt<'a>>) -> password_hash::Result<PasswordHash<'a>> {
+ let algorithm = alg_id.map(Algorithm::try_from).transpose() ? . unwrap_or_default();
+ let version = version.map(Version::try_from).transpose() ? . unwrap_or_default();
+ let salt = salt.into();
+ Self { secret: self.secret, algorithm, version, params, #[cfg(any(target_arch = "x86", target_arch = "x86_64"))] cpu_feat_avx2: self.cpu_feat_avx2 } . hash_password(password, salt)
+ }
+ 
+}
+
+impl<key> From<Params> for Argon2<'key> {
+ fn from(params: Params) -> Self {
+ Self::new(Algorithm::default(), Version::default(), params)
+ }
+ 
+}
+
+impl<key> From<&Params> for Argon2<'key> {
+ fn from(params: &Params) -> Self {
+ Self::from(params.clone())
+ }
+ 
+}
+
+#[cfg(all(test, feature = "alloc", feature = "password-hash"))]
+mod tests {
+ use crate::{ Algorithm, Argon2, Params, PasswordHasher, Salt, Version };
+ const EXAMPLE_PASSWORD: &[u8] = b"hunter42";
+ 
+ const EXAMPLE_SALT: &str = "examplesaltvalue";
+ 
+ #[test]
+ fn decoded_salt_too_short() {
+ let argon2 = Argon2::default();
+ let salt = Salt::from_b64("somesalt").unwrap();
+ let res = argon2.hash_password_customized(EXAMPLE_PASSWORD, None, None, Params::default(), salt);
+ assert_eq!(res, Err(password_hash::Error::SaltInvalid(password_hash::errors::InvalidValue::TooShort)));
+ }
+ 
+ #[test]
+ fn hash_simple_retains_configured_params() {
+ let t_cost = 4;
+ let m_cost = 2048;
+ let p_cost = 2;
+ let version = Version::V0x10;
+ let params = Params::new(m_cost, t_cost, p_cost, None).unwrap();
+ let hasher = Argon2::new(Algorithm::default(), version, params);
+ let salt = Salt::from_b64(EXAMPLE_SALT).unwrap();
+ let hash = hasher.hash_password(EXAMPLE_PASSWORD, salt).unwrap();
+ assert_eq!(hash.version.unwrap(), version.into());
+ for & (param, value) in & [("t", t_cost), ("m", m_cost), ("p", p_cost)] { assert_eq!(hash.params.get(param).and_then(| p | p.decimal().ok()).unwrap(), value ); }
+ }
+ 
+}
+
